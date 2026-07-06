@@ -8,12 +8,15 @@
 """
 import re
 import json
+import math
 import base64
 import pathlib
 import requests
 import urllib3
 import pandas as pd
 import streamlit as st
+import folium
+from streamlit_folium import st_folium
 
 # 591 的憑證鏈在部分環境（如 Streamlit Cloud 較新 OpenSSL）會驗證失敗
 # （Missing Subject Key Identifier）。抓公開頁面，故允許驗證失敗時退回不驗證。
@@ -108,6 +111,42 @@ def rent_per_ping(item):
     p, a = to_int(item.get("price")), to_float_area(item.get("area"))
     return round(p / a) if (p and a) else None
 
+# ---------------------------------------------------------------- 地理位置 / 地圖
+SCHOOL_NAME = "光仁小學"
+SCHOOL_QUERY = "私立光仁小學"          # Nominatim 可解析的名稱
+SCHOOL_FALLBACK = (25.0186447, 121.4743846)  # 解析失敗時的備援座標（新北板橋）
+
+@st.cache_data(show_spinner=False, ttl=7 * 86400)
+def geocode(query):
+    """用 OpenStreetMap Nominatim 將地址解析為 (lat, lon)，失敗回 None。"""
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "json", "limit": 1, "countrycodes": "tw"},
+            headers={"User-Agent": "taipei-rental-survey/1.0 (github.com/audachang)"},
+            timeout=15)
+        j = r.json()
+        if j:
+            return float(j[0]["lat"]), float(j[0]["lon"])
+    except Exception:
+        pass
+    return None
+
+def geocode_listing(it):
+    addr = (it.get("addr") or "").strip()
+    if not addr:
+        return None
+    return geocode(addr if addr.startswith("台北") else "台北市" + addr)
+
+def haversine_km(a, b):
+    """兩組 (lat, lon) 的直線距離（km）。"""
+    R = 6371.0
+    dlat, dlon = math.radians(b[0] - a[0]), math.radians(b[1] - a[1])
+    h = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(a[0])) * math.cos(math.radians(b[0])) *
+         math.sin(dlon / 2) ** 2)
+    return 2 * R * math.asin(math.sqrt(h))
+
 # ---------------------------------------------------------------- 資料載入
 def load_seed():
     if DATA_FILE.exists():
@@ -190,23 +229,27 @@ if not items:
     st.info("目前沒有物件，請在左側貼上 591 連結新增。")
     st.stop()
 
-# ---- 卡片 ----
-st.subheader(f"物件卡片（共 {len(items)} 筆）")
-cols = st.columns(min(len(items), 4) or 1)
-for i, it in enumerate(items):
-    with cols[i % len(cols)]:
-        img_b64 = fetch_img_b64(it.get("img", "")) if it.get("img") else ""
-        rpp = rent_per_ping(it)
-        tags = []
-        if it.get("subsidy"):
-            tags.append('<span class="rtag">租金補貼</span>')
-        if it.get("pet") == "可養寵物":
-            tags.append('<span class="rtag">可養寵物</span>')
-        elif it.get("pet") == "不可養寵物":
-            tags.append('<span class="rtag w">不可養寵</span>')
-        if it.get("deco"):
-            tags.append(f'<span class="rtag">{it["deco"]}</span>')
-        st.markdown(f"""
+tab_cmp, tab_map = st.tabs(["📊 比較", "🗺️ 地圖"])
+
+# ================================================================ 比較 tab
+with tab_cmp:
+    # ---- 卡片 ----
+    st.subheader(f"物件卡片（共 {len(items)} 筆）")
+    cols = st.columns(min(len(items), 4) or 1)
+    for i, it in enumerate(items):
+        with cols[i % len(cols)]:
+            img_b64 = fetch_img_b64(it.get("img", "")) if it.get("img") else ""
+            rpp = rent_per_ping(it)
+            tags = []
+            if it.get("subsidy"):
+                tags.append('<span class="rtag">租金補貼</span>')
+            if it.get("pet") == "可養寵物":
+                tags.append('<span class="rtag">可養寵物</span>')
+            elif it.get("pet") == "不可養寵物":
+                tags.append('<span class="rtag w">不可養寵</span>')
+            if it.get("deco"):
+                tags.append(f'<span class="rtag">{it["deco"]}</span>')
+            st.markdown(f"""
 <div class="rcard">
   {'<img src="'+img_b64+'">' if img_b64 else '<div style="aspect-ratio:16/10;background:#e9edf1"></div>'}
   <div class="b">
@@ -219,43 +262,92 @@ for i, it in enumerate(items):
     <div style="margin-top:6px"><a class="src" href="{it.get('url','')}" target="_blank">看 591 原始刊登 ↗</a></div>
   </div>
 </div>""", unsafe_allow_html=True)
-        if st.button("🗑️ 移除", key=f"del_{it['id']}", use_container_width=True):
-            st.session_state.listings = [x for x in items if x["id"] != it["id"]]
-            st.rerun()
+            if st.button("🗑️ 移除", key=f"del_{it['id']}", use_container_width=True):
+                st.session_state.listings = [x for x in items if x["id"] != it["id"]]
+                st.rerun()
 
-# ---- 比較表 ----
-st.subheader("詳細比較表")
-labels = ["月租金", "格局", "可使用坪數", "租金/坪(估)", "樓層", "電梯",
-          "裝潢", "陽台", "押金", "服務費", "寵物", "租金補貼", "地址", "編號"]
-def row(it):
-    rpp = rent_per_ping(it)
-    return [it.get("price", ""), it.get("layout", ""), it.get("area", ""),
-            f"約 {rpp}" if rpp else "—", it.get("floor", ""), it.get("lift", ""),
-            it.get("deco", "") or "—", it.get("balcony", "") or "—",
-            it.get("deposit", ""), it.get("fee", ""), it.get("pet", "") or "—",
-            "可申請" if it.get("subsidy") else "—", it.get("addr", ""), it.get("id", "")]
+    # ---- 比較表 ----
+    st.subheader("詳細比較表")
+    labels = ["月租金", "格局", "可使用坪數", "租金/坪(估)", "樓層", "電梯",
+              "裝潢", "陽台", "押金", "服務費", "寵物", "租金補貼", "地址", "編號"]
 
-heads = [f"案{chr(65+i)} {it.get('addr','')[:10]}" for i, it in enumerate(items)]
-df = pd.DataFrame({h: row(it) for h, it in zip(heads, items)}, index=labels)
+    def row(it):
+        rpp = rent_per_ping(it)
+        return [it.get("price", ""), it.get("layout", ""), it.get("area", ""),
+                f"約 {rpp}" if rpp else "—", it.get("floor", ""), it.get("lift", ""),
+                it.get("deco", "") or "—", it.get("balcony", "") or "—",
+                it.get("deposit", ""), it.get("fee", ""), it.get("pet", "") or "—",
+                "可申請" if it.get("subsidy") else "—", it.get("addr", ""), it.get("id", "")]
 
-# 標示最佳（租金最低、坪數最大、租金/坪最低）
-prices = [to_int(it.get("price")) for it in items]
-areas = [to_float_area(it.get("area")) for it in items]
-rpps = [rent_per_ping(it) for it in items]
-best = {}
-if any(prices):
-    best["月租金"] = prices.index(min([p for p in prices if p]))
-if any(areas):
-    best["可使用坪數"] = areas.index(max([a for a in areas if a]))
-if any(rpps):
-    valid = [r for r in rpps if r]
-    best["租金/坪(估)"] = rpps.index(min(valid))
+    heads = [f"案{chr(65+i)} {it.get('addr','')[:10]}" for i, it in enumerate(items)]
+    df = pd.DataFrame({h: row(it) for h, it in zip(heads, items)}, index=labels)
 
-def hl(data):
-    styles = pd.DataFrame("", index=data.index, columns=data.columns)
-    for lab, ci in best.items():
-        styles.loc[lab, data.columns[ci]] = "background-color:#fef6e0;font-weight:700"
-    return styles
+    # 標示最佳（租金最低、坪數最大、租金/坪最低）
+    prices = [to_int(it.get("price")) for it in items]
+    areas = [to_float_area(it.get("area")) for it in items]
+    rpps = [rent_per_ping(it) for it in items]
+    best = {}
+    if any(prices):
+        best["月租金"] = prices.index(min([p for p in prices if p]))
+    if any(areas):
+        best["可使用坪數"] = areas.index(max([a for a in areas if a]))
+    if any(rpps):
+        valid = [r for r in rpps if r]
+        best["租金/坪(估)"] = rpps.index(min(valid))
 
-st.dataframe(df.style.apply(hl, axis=None), use_container_width=True, height=560)
-st.caption("＊淺黃 = 該列相對較佳（租金最低 / 坪數最大 / 租金每坪最低）。數字以刊登當下為準，請以看屋確認為主。")
+    def hl(data):
+        styles = pd.DataFrame("", index=data.index, columns=data.columns)
+        for lab, ci in best.items():
+            styles.loc[lab, data.columns[ci]] = "background-color:#fef6e0;font-weight:700"
+        return styles
+
+    st.dataframe(df.style.apply(hl, axis=None), use_container_width=True, height=560)
+    st.caption("＊淺黃 = 該列相對較佳（租金最低 / 坪數最大 / 租金每坪最低）。數字以刊登當下為準，請以看屋確認為主。")
+
+# ================================================================ 地圖 tab
+with tab_map:
+    st.subheader(f"位置圖（以 {SCHOOL_NAME} 為中心）")
+    school = geocode(SCHOOL_QUERY) or SCHOOL_FALLBACK
+    with st.spinner("定位各物件中…"):
+        located, missing = [], []
+        for i, it in enumerate(items):
+            loc = geocode_listing(it)
+            (located.append((i, it, loc)) if loc else missing.append(it))
+
+    fmap = folium.Map(location=list(school), zoom_start=15,
+                      tiles="OpenStreetMap", control_scale=True)
+    folium.Marker(list(school), tooltip=f"🎒 {SCHOOL_NAME}", popup=SCHOOL_NAME,
+                  icon=folium.Icon(color="red", icon="star")).add_to(fmap)
+    bounds = [list(school)]
+    for i, it, loc in located:
+        label = f"案{chr(65 + i)}"
+        dist = haversine_km(school, loc)
+        gmap = f"https://www.google.com/maps/search/?api=1&query={loc[0]},{loc[1]}"
+        popup_html = (
+            f"<b>{label}</b> {it.get('title','')[:22]}<br>"
+            f"💰 {it.get('price','?')} 元/月　{it.get('layout','')}<br>"
+            f"📍 {it.get('addr','')}<br>"
+            f"🎒 距 {SCHOOL_NAME} 約 {dist:.1f} km（直線）<br>"
+            f"<a href='{it.get('url','')}' target='_blank'>591 刊登 ↗</a>　"
+            f"<a href='{gmap}' target='_blank'>Google 地圖 ↗</a>")
+        folium.Marker(list(loc), tooltip=f"{label}｜{it.get('price','')}元",
+                      popup=folium.Popup(popup_html, max_width=260),
+                      icon=folium.Icon(color="blue", icon="home")).add_to(fmap)
+        bounds.append(list(loc))
+    if len(bounds) > 1:
+        fmap.fit_bounds(bounds, padding=(30, 30))
+    st_folium(fmap, use_container_width=True, height=560, returned_objects=[])
+
+    if located:
+        drows = [{"物件": f"案{chr(65 + i)}", "地址": it.get("addr", ""),
+                  "月租金": it.get("price", ""),
+                  f"距{SCHOOL_NAME}(km)": round(haversine_km(school, loc), 2)}
+                 for i, it, loc in located]
+        st.dataframe(
+            pd.DataFrame(drows).sort_values(f"距{SCHOOL_NAME}(km)"),
+            use_container_width=True, hide_index=True)
+    if missing:
+        st.warning("下列物件地址無法定位，未顯示於地圖：" +
+                   "、".join(m.get("addr") or m.get("title", "")[:10] for m in missing))
+    st.caption(f"🎒 紅色 = {SCHOOL_NAME}；🏠 藍色 = 租案。距離為直線估算，"
+               "實際步行／車程請點各 marker 內的 Google 地圖連結確認。底圖 © OpenStreetMap。")
