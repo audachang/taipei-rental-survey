@@ -113,8 +113,9 @@ def rent_per_ping(item):
 
 # ---------------------------------------------------------------- 地理位置 / 地圖
 SCHOOL_NAME = "光仁小學"
-SCHOOL_QUERY = "私立光仁小學"          # Nominatim 可解析的名稱
-SCHOOL_FALLBACK = (25.0186447, 121.4743846)  # 解析失敗時的備援座標（新北板橋）
+# 正確地址：108臺北市萬華區壽德里萬大路423巷15號（門牌無法 geocode，用巷弄中心）
+SCHOOL_QUERY = "台北市萬華區萬大路423巷"
+SCHOOL_FALLBACK = (25.0217317, 121.5012011)  # 解析失敗時的備援座標（萬華萬大路423巷）
 
 @st.cache_data(show_spinner=False, ttl=7 * 86400)
 def geocode(query):
