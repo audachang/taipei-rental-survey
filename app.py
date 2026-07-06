@@ -7,7 +7,6 @@
 部署：Streamlit Community Cloud，主檔案設為 app.py
 """
 import re
-import io
 import json
 import base64
 import pathlib
@@ -170,9 +169,12 @@ with st.sidebar:
         data=json.dumps(st.session_state.listings, ensure_ascii=False, indent=2),
         file_name="listings.json", mime="application/json", use_container_width=True)
     up = st.file_uploader("⬆️ 上傳 listings.json 還原", type="json")
-    if up is not None:
+    # 只在「換了新檔」時載入一次；否則 uploader 每次 rerun 都持有同一檔，
+    # 會與 st.rerun() 形成無限重跑迴圈，畫面停在舊狀態直到手動移除該檔。
+    if up is not None and st.session_state.get("_uploaded_id") != up.file_id:
         try:
-            st.session_state.listings = json.load(io.TextIOWrapper(up, encoding="utf-8"))
+            st.session_state.listings = json.loads(up.getvalue().decode("utf-8"))
+            st.session_state._uploaded_id = up.file_id
             st.success("已載入。")
             st.rerun()
         except Exception as e:
