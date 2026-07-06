@@ -12,8 +12,20 @@ import json
 import base64
 import pathlib
 import requests
+import urllib3
 import pandas as pd
 import streamlit as st
+
+# 591 的憑證鏈在部分環境（如 Streamlit Cloud 較新 OpenSSL）會驗證失敗
+# （Missing Subject Key Identifier）。抓公開頁面，故允許驗證失敗時退回不驗證。
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def _get(url, timeout=15):
+    """先正常驗證憑證，失敗則退回 verify=False 再試一次。"""
+    try:
+        return requests.get(url, headers=HEADERS, timeout=timeout)
+    except requests.exceptions.SSLError:
+        return requests.get(url, headers=HEADERS, timeout=timeout, verify=False)
 
 DATA_FILE = pathlib.Path(__file__).parent / "listings.json"
 HEADERS = {
@@ -34,13 +46,13 @@ def _val(html, label):
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_html(url):
-    return requests.get(url, headers=HEADERS, timeout=15).text
+    return _get(url).text
 
 @st.cache_data(show_spinner=False, ttl=86400)
 def fetch_img_b64(img_url):
     """伺服器端抓圖並轉 base64，避免前端 hotlink 被擋。"""
     try:
-        r = requests.get(img_url, headers=HEADERS, timeout=15)
+        r = _get(img_url)
         if r.ok and r.content:
             return "data:image/jpeg;base64," + base64.b64encode(r.content).decode()
     except Exception:
@@ -54,6 +66,8 @@ def parse_listing(url):
         raise ValueError("看起來不是有效的 591 物件連結（找不到物件編號）。")
     ident = m.group(1)
     html = fetch_html(url)
+    if "頁面不存在" in html or "您訪問的頁面" in html:
+        raise ValueError("找不到此物件，可能已下架或連結有誤（HTTP 404）。")
     title = _og(html, "title").replace(" - 591租屋網", "").strip()
     if not title:
         raise ValueError("抓不到頁面內容，請確認連結正確或稍後再試。")
