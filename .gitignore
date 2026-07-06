@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 舊的靜態頁與其素材（改用 Streamlit，不納入版控）
+租案比較.html
+images/
+
+# 與 Streamlit app 無關的文件
+cowork環境設定方案.docx
+cowork環境設定方案.pdf
+_verify.jpg
