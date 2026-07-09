@@ -220,7 +220,7 @@ with st.sidebar:
         except Exception as e:
             st.error(f"讀取失敗：{e}")
 
-    if st.button("↩️ 重設為原始 5 案", use_container_width=True):
+    if st.button("↩️ 重設為預設資料", use_container_width=True):
         fetch_html.clear()
         st.session_state.listings = load_seed()
         st.rerun()
