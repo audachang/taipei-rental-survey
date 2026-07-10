@@ -320,12 +320,20 @@ if not items:
     st.info("目前沒有物件，請在左側貼上 591 連結新增。")
     st.stop()
 
+# ---- 編號依「距光仁小學直線距離」排序：案A = 最近，無法定位者殿後 ----
+_school = geocode(SCHOOL_QUERY) or SCHOOL_FALLBACK
+with st.spinner("依距離排序中…"):
+    def _dist_key(it):
+        loc = geocode_listing(it)
+        return haversine_km(_school, loc) if loc else float("inf")
+    items = sorted(items, key=_dist_key)
+
 tab_cmp, tab_map = st.tabs(["📊 比較", "🗺️ 地圖"])
 
 # ================================================================ 比較 tab
 with tab_cmp:
     # ---- 卡片 ----
-    st.subheader(f"物件卡片（共 {len(items)} 筆）")
+    st.subheader(f"物件卡片（共 {len(items)} 筆，依距光仁小學由近到遠）")
     cols = st.columns(min(len(items), 4) or 1)
     for i, it in enumerate(items):
         with cols[i % len(cols)]:
@@ -394,7 +402,8 @@ with tab_cmp:
         return styles
 
     st.dataframe(df.style.apply(hl, axis=None), use_container_width=True, height=560)
-    st.caption("＊淺黃 = 該列相對較佳（租金最低 / 坪數最大 / 租金每坪最低）。數字以刊登當下為準，請以看屋確認為主。")
+    st.caption("＊編號依距光仁小學直線距離排序（案A 最近，無法定位者殿後）。"
+               "淺黃 = 該列相對較佳（租金最低 / 坪數最大 / 租金每坪最低）。數字以刊登當下為準，請以看屋確認為主。")
 
 # ================================================================ 地圖 tab
 with tab_map:
@@ -404,7 +413,10 @@ with tab_map:
         located, missing = [], []
         for i, it in enumerate(items):
             loc = geocode_listing(it)
-            (located.append((i, it, loc)) if loc else missing.append(it))
+            if loc:
+                located.append((i, it, loc))
+            else:
+                missing.append(it)
 
     fmap = folium.Map(location=list(school), zoom_start=15,
                       tiles="OpenStreetMap", control_scale=True)
@@ -428,7 +440,7 @@ with tab_map:
         bounds.append(list(loc))
     if len(bounds) > 1:
         fmap.fit_bounds(bounds, padding=(30, 30))
-    st_folium(fmap, use_container_width=True, height=560, returned_objects=[])
+    _ = st_folium(fmap, use_container_width=True, height=560, returned_objects=[])
 
     if located:
         drows = [{"物件": f"案{chr(65 + i)}", "地址": it.get("addr", ""),
