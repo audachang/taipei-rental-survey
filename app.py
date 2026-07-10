@@ -448,6 +448,7 @@ with tab_map:
     folium.Marker(list(school), tooltip=f"🎒 {SCHOOL_NAME}", popup=SCHOOL_NAME,
                   icon=folium.Icon(color="red", icon="star")).add_to(fmap)
     bounds = [list(school)]
+    _seen = {}   # 同座標（同街道/巷弄定位）的 marker 錯開顯示，避免完全疊住看不到
     for i, it, loc in located:
         label = f"案{chr(65 + i)}"
         dist = haversine_km(school, loc)
@@ -463,10 +464,15 @@ with tab_map:
             f"{foot_txt}　{car_txt}<br>"
             f"<a href='{it.get('url','')}' target='_blank'>591 刊登 ↗</a>　"
             f"<a href='{gmap}' target='_blank'>Google 地圖 ↗</a>")
-        folium.Marker(list(loc), tooltip=f"{label}｜{it.get('price','')}元",
+        n = _seen.get(loc, 0)
+        _seen[loc] = n + 1
+        show = loc if n == 0 else (          # 第2個起以約25m半徑環狀展開
+            loc[0] + 0.00025 * n * math.cos(2.4 * n),
+            loc[1] + 0.00025 * n * math.sin(2.4 * n))
+        folium.Marker(list(show), tooltip=f"{label}｜{it.get('price','')}元",
                       popup=folium.Popup(popup_html, max_width=260),
                       icon=folium.Icon(color="blue", icon="home")).add_to(fmap)
-        bounds.append(list(loc))
+        bounds.append(list(show))
     if len(bounds) > 1:
         fmap.fit_bounds(bounds, padding=(30, 30))
     _ = st_folium(fmap, use_container_width=True, height=560, returned_objects=[])
@@ -490,6 +496,7 @@ with tab_map:
     if missing:
         st.warning("下列物件地址無法定位，未顯示於地圖：" +
                    "、".join(m.get("addr") or m.get("title", "")[:10] for m in missing))
-    st.caption(f"🎒 紅色 = {SCHOOL_NAME}；🏠 藍色 = 租案。步行／開車為 OSRM 路網估算"
+    st.caption(f"🎒 紅色 = {SCHOOL_NAME}；🏠 藍色 = 租案。591 地址只到街道／巷弄層級，"
+               "同地址的物件會以約 25m 環狀錯開顯示（位置為近似值）。步行／開車為 OSRM 路網估算"
                "（不含紅綠燈與即時路況，僅供參考），也可點 marker 內的 Google 地圖連結複查。"
                "底圖與路網資料 © OpenStreetMap。")
