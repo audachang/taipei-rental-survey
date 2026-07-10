@@ -162,6 +162,27 @@ def haversine_km(a, b):
          math.sin(dlon / 2) ** 2)
     return 2 * R * math.asin(math.sqrt(h))
 
+# OSRM 公用路線伺服器（FOSSGIS，無需金鑰）：步行與開車兩種 profile
+OSRM_BASE = {"foot": "https://routing.openstreetmap.de/routed-foot/route/v1/foot",
+             "car": "https://routing.openstreetmap.de/routed-car/route/v1/driving"}
+
+@st.cache_data(show_spinner=False, ttl=7 * 86400)
+def route_km_min(profile, a, b):
+    """以 OSRM 計算實際路線，回 (距離km, 時間分)；失敗回 None。
+    a、b 為 (lat, lon)；profile 為 "foot" 或 "car"。"""
+    try:
+        url = f"{OSRM_BASE[profile]}/{a[1]},{a[0]};{b[1]},{b[0]}"
+        r = requests.get(url, params={"overview": "false"},
+                         headers={"User-Agent": "taipei-rental-survey/1.0"},
+                         timeout=15)
+        j = r.json()
+        if j.get("code") == "Ok" and j.get("routes"):
+            rt = j["routes"][0]
+            return round(rt["distance"] / 1000, 2), max(1, round(rt["duration"] / 60))
+    except Exception:
+        pass
+    return None
+
 # ---------------------------------------------------------------- GitHub 同步
 def _gh_conf():
     """讀取 Streamlit secrets 的 GitHub 設定；未設定 token 時回 None（僅存本機）。"""
@@ -409,7 +430,7 @@ with tab_cmp:
 with tab_map:
     st.subheader(f"位置圖（以 {SCHOOL_NAME} 為中心）")
     school = geocode(SCHOOL_QUERY) or SCHOOL_FALLBACK
-    with st.spinner("定位各物件中…"):
+    with st.spinner("定位各物件並計算步行／開車路線中…"):
         located, missing = [], []
         for i, it in enumerate(items):
             loc = geocode_listing(it)
@@ -417,6 +438,10 @@ with tab_map:
                 located.append((i, it, loc))
             else:
                 missing.append(it)
+        # 逐一向 OSRM 取步行/開車路線（有 7 天快取，之後重跑幾乎不花時間）
+        routes = {it["id"]: (route_km_min("foot", school, loc),
+                             route_km_min("car", school, loc))
+                  for _, it, loc in located}
 
     fmap = folium.Map(location=list(school), zoom_start=15,
                       tiles="OpenStreetMap", control_scale=True)
@@ -427,11 +452,15 @@ with tab_map:
         label = f"案{chr(65 + i)}"
         dist = haversine_km(school, loc)
         gmap = f"https://www.google.com/maps/search/?api=1&query={loc[0]},{loc[1]}"
+        foot, car = routes.get(it["id"], (None, None))
+        foot_txt = f"🚶 {foot[0]} km／約 {foot[1]} 分" if foot else "🚶 —"
+        car_txt = f"🚗 {car[0]} km／約 {car[1]} 分" if car else "🚗 —"
         popup_html = (
             f"<b>{label}</b> {it.get('title','')[:22]}<br>"
             f"💰 {it.get('price','?')} 元/月　{it.get('layout','')}<br>"
             f"📍 {it.get('addr','')}<br>"
             f"🎒 距 {SCHOOL_NAME} 約 {dist:.1f} km（直線）<br>"
+            f"{foot_txt}　{car_txt}<br>"
             f"<a href='{it.get('url','')}' target='_blank'>591 刊登 ↗</a>　"
             f"<a href='{gmap}' target='_blank'>Google 地圖 ↗</a>")
         folium.Marker(list(loc), tooltip=f"{label}｜{it.get('price','')}元",
@@ -443,15 +472,24 @@ with tab_map:
     _ = st_folium(fmap, use_container_width=True, height=560, returned_objects=[])
 
     if located:
-        drows = [{"物件": f"案{chr(65 + i)}", "地址": it.get("addr", ""),
-                  "月租金": it.get("price", ""),
-                  f"距{SCHOOL_NAME}(km)": round(haversine_km(school, loc), 2)}
-                 for i, it, loc in located]
+        drows = []
+        for i, it, loc in located:
+            foot, car = routes.get(it["id"], (None, None))
+            drows.append({
+                "物件": f"案{chr(65 + i)}", "地址": it.get("addr", ""),
+                "月租金": it.get("price", ""),
+                "直線(km)": round(haversine_km(school, loc), 2),
+                "步行(km)": foot[0] if foot else None,
+                "步行(分)": foot[1] if foot else None,
+                "開車(km)": car[0] if car else None,
+                "開車(分)": car[1] if car else None,
+            })
         st.dataframe(
-            pd.DataFrame(drows).sort_values(f"距{SCHOOL_NAME}(km)"),
+            pd.DataFrame(drows).sort_values("步行(分)", na_position="last"),
             use_container_width=True, hide_index=True)
     if missing:
         st.warning("下列物件地址無法定位，未顯示於地圖：" +
                    "、".join(m.get("addr") or m.get("title", "")[:10] for m in missing))
-    st.caption(f"🎒 紅色 = {SCHOOL_NAME}；🏠 藍色 = 租案。距離為直線估算，"
-               "實際步行／車程請點各 marker 內的 Google 地圖連結確認。底圖 © OpenStreetMap。")
+    st.caption(f"🎒 紅色 = {SCHOOL_NAME}；🏠 藍色 = 租案。步行／開車為 OSRM 路網估算"
+               "（不含紅綠燈與即時路況，僅供參考），也可點 marker 內的 Google 地圖連結複查。"
+               "底圖與路網資料 © OpenStreetMap。")
