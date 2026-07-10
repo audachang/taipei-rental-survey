@@ -16,6 +16,7 @@ import requests
 import urllib3
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import folium
 from streamlit_folium import st_folium
 
@@ -182,6 +183,13 @@ def route_km_min(profile, a, b):
     except Exception:
         pass
     return None
+
+def _gmaps_key():
+    """讀取 Google Maps JavaScript API 金鑰（Streamlit secrets）；未設定回空字串。"""
+    try:
+        return st.secrets.get("GOOGLE_MAPS_KEY", "")
+    except Exception:
+        return ""
 
 # ---------------------------------------------------------------- GitHub 同步
 def _gh_conf():
@@ -443,12 +451,8 @@ with tab_map:
                              route_km_min("car", school, loc))
                   for _, it, loc in located}
 
-    fmap = folium.Map(location=list(school), zoom_start=15,
-                      tiles="OpenStreetMap", control_scale=True)
-    folium.Marker(list(school), tooltip=f"🎒 {SCHOOL_NAME}", popup=SCHOOL_NAME,
-                  icon=folium.Icon(color="red", icon="star")).add_to(fmap)
-    bounds = [list(school)]
-    _seen = {}   # 同座標（同街道/巷弄定位）的 marker 錯開顯示，避免完全疊住看不到
+    # ---- 準備 marker 資料（兩種底圖共用；同座標物件環狀錯開約 25m）----
+    _seen, marks = {}, []
     for i, it, loc in located:
         label = f"案{chr(65 + i)}"
         dist = haversine_km(school, loc)
@@ -469,13 +473,57 @@ with tab_map:
         show = loc if n == 0 else (          # 第2個起以約25m半徑環狀展開
             loc[0] + 0.00025 * n * math.cos(2.4 * n),
             loc[1] + 0.00025 * n * math.sin(2.4 * n))
-        folium.Marker(list(show), tooltip=f"{label}｜{it.get('price','')}元",
-                      popup=folium.Popup(popup_html, max_width=260),
-                      icon=folium.Icon(color="blue", icon="home")).add_to(fmap)
-        bounds.append(list(show))
-    if len(bounds) > 1:
-        fmap.fit_bounds(bounds, padding=(30, 30))
-    _ = st_folium(fmap, use_container_width=True, height=560, returned_objects=[])
+        marks.append({"lat": show[0], "lng": show[1], "letter": chr(65 + i),
+                      "tip": f"{label}｜{it.get('price','')}元", "info": popup_html})
+
+    gkey = _gmaps_key()
+    if gkey:
+        # ---- Google Maps JavaScript API 版 ----
+        gm_html = f"""
+<div id="gmap" style="width:100%;height:560px"></div>
+<script>
+function initMap() {{
+  const school = {{lat: {school[0]:.7f}, lng: {school[1]:.7f}}};
+  const pts = {json.dumps(marks, ensure_ascii=False)};
+  const map = new google.maps.Map(document.getElementById("gmap"),
+      {{center: school, zoom: 15}});
+  const iw = new google.maps.InfoWindow();
+  const b = new google.maps.LatLngBounds();
+  b.extend(school);
+  new google.maps.Marker({{position: school, map: map, title: "🎒 {SCHOOL_NAME}"}});
+  pts.forEach(function(p) {{
+    const m = new google.maps.Marker({{
+      position: {{lat: p.lat, lng: p.lng}}, map: map, title: p.tip,
+      label: {{text: p.letter, color: "#fff", fontSize: "10px", fontWeight: "700"}},
+      icon: {{path: google.maps.SymbolPath.CIRCLE, scale: 9,
+              fillColor: "#3d90d9", fillOpacity: 0.95,
+              strokeColor: "#1f6fb2", strokeWeight: 2}}
+    }});
+    m.addListener("click", function() {{ iw.setContent(p.info); iw.open(map, m); }});
+    b.extend(m.getPosition());
+  }});
+  if (pts.length) map.fitBounds(b, 40);
+}}
+</script>
+<script async src="https://maps.googleapis.com/maps/api/js?key={gkey}&callback=initMap"></script>"""
+        components.html(gm_html, height=575)
+    else:
+        # ---- Folium / OpenStreetMap 版（未設定 GOOGLE_MAPS_KEY 時）----
+        fmap = folium.Map(location=list(school), zoom_start=15,
+                          tiles="OpenStreetMap", control_scale=True)
+        folium.Marker(list(school), tooltip=f"🎒 {SCHOOL_NAME}", popup=SCHOOL_NAME,
+                      icon=folium.Icon(color="red", icon="star")).add_to(fmap)
+        bounds = [list(school)]
+        for p in marks:
+            folium.CircleMarker(
+                [p["lat"], p["lng"]], radius=7, weight=2, color="#1f6fb2",
+                fill=True, fill_color="#3d90d9", fill_opacity=0.9,
+                tooltip=p["tip"],
+                popup=folium.Popup(p["info"], max_width=260)).add_to(fmap)
+            bounds.append([p["lat"], p["lng"]])
+        if len(bounds) > 1:
+            fmap.fit_bounds(bounds, padding=(30, 30))
+        _ = st_folium(fmap, use_container_width=True, height=560, returned_objects=[])
 
     if located:
         drows = []
@@ -496,7 +544,7 @@ with tab_map:
     if missing:
         st.warning("下列物件地址無法定位，未顯示於地圖：" +
                    "、".join(m.get("addr") or m.get("title", "")[:10] for m in missing))
-    st.caption(f"🎒 紅色 = {SCHOOL_NAME}；🏠 藍色 = 租案。591 地址只到街道／巷弄層級，"
+    st.caption(f"🎒 紅色 = {SCHOOL_NAME}；🔵 藍色圓點 = 租案（滑鼠移上可看編號與租金）。591 地址只到街道／巷弄層級，"
                "同地址的物件會以約 25m 環狀錯開顯示（位置為近似值）。步行／開車為 OSRM 路網估算"
                "（不含紅綠燈與即時路況，僅供參考），也可點 marker 內的 Google 地圖連結複查。"
-               "底圖與路網資料 © OpenStreetMap。")
+               "路網估算 © OpenStreetMap；底圖為 Google 地圖（未設 GOOGLE_MAPS_KEY 時為 OpenStreetMap）。")
