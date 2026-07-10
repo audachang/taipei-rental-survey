@@ -2,7 +2,8 @@
 台北萬華區租屋比較 — Streamlit 動態版
 - 貼上 591 租屋連結即可即時抓取、解析、新增到比較頁
 - 可移除任一物件
-- 下載 / 上傳 listings.json 保存資料（持久化方案 A）
+- 新增 / 移除即自動寫回 listings.json；設定 GITHUB_TOKEN 後並自動 commit 回 GitHub
+  （容器重啟也不遺失。token 放 Streamlit secrets，勿寫入程式碼）
 
 部署：Streamlit Community Cloud，主檔案設為 app.py
 """
@@ -137,7 +138,20 @@ def geocode_listing(it):
     addr = (it.get("addr") or "").strip()
     if not addr:
         return None
-    return geocode(addr if addr.startswith("台北") else "台北市" + addr)
+    # 已含縣市（台北市/新北市）者直接查詢；否則預設補上台北市
+    if not (addr.startswith("台北") or addr.startswith("新北")):
+        addr = "台北市" + addr
+    # 完整地址查不到時，逐步去掉 弄→巷→號，退到街路層級再試
+    queries = [addr]
+    for pat in (r"\d+弄$", r"\d+巷(\d+弄)?$", r"\d+(-\d+)?號.*$"):
+        q = re.sub(pat, "", addr)
+        if q and q not in queries:
+            queries.append(q)
+    for q in queries:
+        loc = geocode(q)
+        if loc:
+            return loc
+    return None
 
 def haversine_km(a, b):
     """兩組 (lat, lon) 的直線距離（km）。"""
@@ -148,17 +162,104 @@ def haversine_km(a, b):
          math.sin(dlon / 2) ** 2)
     return 2 * R * math.asin(math.sqrt(h))
 
+# ---------------------------------------------------------------- GitHub 同步
+def _gh_conf():
+    """讀取 Streamlit secrets 的 GitHub 設定；未設定 token 時回 None（僅存本機）。"""
+    try:
+        tok = st.secrets.get("GITHUB_TOKEN", "")
+        if not tok:
+            return None
+        return {
+            "token": tok,
+            "repo": st.secrets.get("GITHUB_REPO", "audachang/taipei-rental-survey"),
+            "branch": st.secrets.get("GITHUB_BRANCH", "main"),
+            "path": st.secrets.get("GITHUB_PATH", "listings.json"),
+        }
+    except Exception:          # 無 secrets.toml 時 st.secrets 會拋例外
+        return None
+
+def _gh_url(conf):
+    return f"https://api.github.com/repos/{conf['repo']}/contents/{conf['path']}"
+
+def _gh_headers(conf):
+    return {"Authorization": f"Bearer {conf['token']}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}
+
+def gh_load():
+    """從 GitHub repo 讀取 listings.json；未設定或失敗回 None。"""
+    conf = _gh_conf()
+    if not conf:
+        return None
+    try:
+        r = requests.get(_gh_url(conf), headers=_gh_headers(conf),
+                         params={"ref": conf["branch"]}, timeout=15)
+        if r.status_code == 200:
+            raw = base64.b64decode(r.json()["content"]).decode("utf-8")
+            return json.loads(raw)
+    except Exception:
+        pass
+    return None
+
+def gh_save(text):
+    """把 listings.json 內容 commit 回 GitHub repo；回傳 (成功, 訊息)。"""
+    conf = _gh_conf()
+    if not conf:
+        return True, "local-only"
+    try:
+        url, headers = _gh_url(conf), _gh_headers(conf)
+        sha = None
+        r = requests.get(url, headers=headers,
+                         params={"ref": conf["branch"]}, timeout=15)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+        body = {"message": f"web 自動存檔：租屋清單共 {len(st.session_state.listings)} 筆",
+                "content": base64.b64encode(text.encode("utf-8")).decode(),
+                "branch": conf["branch"]}
+        if sha:
+            body["sha"] = sha
+        r = requests.put(url, headers=headers, json=body, timeout=20)
+        if r.status_code in (200, 201):
+            return True, "ok"
+        return False, f"GitHub API {r.status_code}: {r.json().get('message', '')}"
+    except Exception as e:
+        return False, str(e)
+
 # ---------------------------------------------------------------- 資料載入
 def load_seed():
+    """優先讀 GitHub（雲端重啟後仍是最新）；否則讀本機 listings.json。"""
+    remote = gh_load()
+    if remote is not None:
+        try:    # 寫一份到本機當快取；失敗不影響使用
+            DATA_FILE.write_text(json.dumps(remote, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+        except Exception:
+            pass
+        return remote
     if DATA_FILE.exists():
         return json.loads(DATA_FILE.read_text(encoding="utf-8"))
     return []
+
+def save_seed():
+    """寫回本機 listings.json；若設定 GITHUB_TOKEN 則同步 commit 到 GitHub。"""
+    text = json.dumps(st.session_state.listings, ensure_ascii=False, indent=2)
+    ok = True
+    try:
+        DATA_FILE.write_text(text, encoding="utf-8")
+    except Exception as e:
+        ok = False
+        st.warning(f"本機儲存失敗：{e}")
+    ok_gh, msg = gh_save(text)
+    if not ok_gh:
+        ok = False
+        st.warning(f"GitHub 同步失敗（資料仍保留於本次連線）：{msg}")
+    return ok
 
 if "listings" not in st.session_state:
     st.session_state.listings = load_seed()
 
 # ---------------------------------------------------------------- 頁面
-st.set_page_config(page_title="台北萬華區租屋比較", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="台北萬板區域租屋比較", page_icon="🏠", layout="wide")
 
 st.markdown("""
 <style>
@@ -177,8 +278,8 @@ a.src{font-size:12px;color:#2f6f4f;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏠 台北萬華區租屋比較")
-st.caption("資料來源：591 租屋網 · 貼上連結即時新增 · 資料以下載 JSON 保存")
+st.title("🏠 台北萬板區域租屋比較（近光仁小學）")
+st.caption("資料來源：591 租屋網 · 涵蓋萬華與板橋 · 貼上連結即時新增 · 變更自動寫回 listings.json")
 
 # ---- 側欄：新增 / 保存 ----
 with st.sidebar:
@@ -194,6 +295,7 @@ with st.sidebar:
                     st.warning("此物件已在清單中。")
                 else:
                     st.session_state.listings.append(item)
+                    save_seed()
                     st.success(f"已新增：{item['title'][:20]}…")
                     st.rerun()
             except Exception as e:
@@ -202,28 +304,16 @@ with st.sidebar:
             st.info("請先貼上連結。")
 
     st.divider()
-    st.header("💾 保存 / 還原")
-    st.caption("方案 A：修改存在本次連線，下載 JSON 後 commit 回 repo 即永久生效。")
+    st.header("💾 資料保存")
+    if _gh_conf():
+        st.caption("☁️ 新增／移除自動存檔並 commit 回 GitHub repo，容器重啟不遺失。")
+    else:
+        st.caption("💻 新增／移除自動寫回本機 listings.json。"
+                   "未設定 GITHUB_TOKEN（Secrets），雲端容器重啟會還原為 repo 版本。")
     st.download_button(
-        "⬇️ 下載目前 listings.json",
+        "⬇️ 下載備份 listings.json",
         data=json.dumps(st.session_state.listings, ensure_ascii=False, indent=2),
         file_name="listings.json", mime="application/json", use_container_width=True)
-    up = st.file_uploader("⬆️ 上傳 listings.json 還原", type="json")
-    # 只在「換了新檔」時載入一次；否則 uploader 每次 rerun 都持有同一檔，
-    # 會與 st.rerun() 形成無限重跑迴圈，畫面停在舊狀態直到手動移除該檔。
-    if up is not None and st.session_state.get("_uploaded_id") != up.file_id:
-        try:
-            st.session_state.listings = json.loads(up.getvalue().decode("utf-8"))
-            st.session_state._uploaded_id = up.file_id
-            st.success("已載入。")
-            st.rerun()
-        except Exception as e:
-            st.error(f"讀取失敗：{e}")
-
-    if st.button("↩️ 重設為預設資料", use_container_width=True):
-        fetch_html.clear()
-        st.session_state.listings = load_seed()
-        st.rerun()
 
 items = st.session_state.listings
 if not items:
@@ -265,6 +355,7 @@ with tab_cmp:
 </div>""", unsafe_allow_html=True)
             if st.button("🗑️ 移除", key=f"del_{it['id']}", use_container_width=True):
                 st.session_state.listings = [x for x in items if x["id"] != it["id"]]
+                save_seed()
                 st.rerun()
 
     # ---- 比較表 ----
